@@ -218,4 +218,37 @@ describe('model provider input normalization', () => {
       expect.objectContaining({ code: 'VALIDATION_ERROR' }),
     );
   });
+
+  it('maps capabilities field and preserves it when normalizing inputs', () => {
+    const models = modelsFromInputs([
+      {
+        modelId: 'vision-model',
+        attachment: true,
+        capabilities: { support_image: true },
+      },
+    ]);
+    expect(models['vision-model']).toMatchObject({
+      attachment: true,
+      capabilities: { support_image: true },
+    });
+  });
+
+  it('merges capabilities and handles modalities properly', () => {
+    const existing = {
+      'vision-model': {
+        capabilities: { experimental: true },
+      },
+    };
+    const merged = mergeModelsFromInputs(existing, [
+      {
+        modelId: 'vision-model',
+        capabilities: { support_image: true },
+        modalities: { input: ['text', 'image'] },
+      },
+    ]);
+    expect(merged['vision-model']).toMatchObject({
+      capabilities: { experimental: true, support_image: true },
+      modalities: { input: ['text', 'image'] },
+    });
+  });
 });

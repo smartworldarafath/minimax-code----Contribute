@@ -76,6 +76,11 @@ export interface McodeProviderModelInput {
   readonly temperature?: boolean;
   readonly modalities?: { readonly input?: readonly string[]; readonly output?: readonly string[] };
   readonly limit?: { readonly context?: number; readonly output?: number };
+  readonly capabilities?: {
+    readonly support_image?: boolean;
+    readonly support_video?: boolean;
+    readonly [key: string]: unknown;
+  };
 }
 
 export interface McodeProviderTemplate {

@@ -754,6 +754,37 @@ describe('model capability helpers', () => {
     expect(capabilities).not.toHaveProperty('max_request_body_bytes');
     expect(capabilities).not.toHaveProperty('max_attachments_count');
   });
+
+  it('recognizes vision capabilities from attachment: true', () => {
+    const capabilities = capabilitiesFromModelConfig({
+      attachment: true,
+    });
+    expect(capabilities.support_image).toBe(true);
+  });
+
+  it('recognizes vision capabilities from array-form modalities', () => {
+    const capabilities = capabilitiesFromModelConfig({
+      modalities: ['text', 'image', 'video'],
+    } as unknown as LocalModelConfig);
+    expect(capabilities.support_image).toBe(true);
+    expect(capabilities.support_video).toBe(true);
+  });
+
+  it('recognizes vision capabilities from top-level vision and support_image flags', () => {
+    expect(
+      capabilitiesFromModelConfig({ vision: true } as unknown as LocalModelConfig).support_image,
+    ).toBe(true);
+    expect(
+      capabilitiesFromModelConfig({ support_image: true } as unknown as LocalModelConfig).support_image,
+    ).toBe(true);
+  });
+
+  it('propagates support_image to modelRef when modelConfig has attachment: true', () => {
+    const ref = modelRefForModel('custom_provider:anthropic', 'claude-3-5-sonnet', {
+      attachment: true,
+    });
+    expect(ref.capabilities?.support_image).toBe(true);
+  });
 });
 
 function modelConfigWithThinking(

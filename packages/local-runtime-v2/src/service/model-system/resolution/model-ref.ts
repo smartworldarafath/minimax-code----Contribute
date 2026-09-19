@@ -487,12 +487,31 @@ export function resolveModelThinkingProtocol(
 export function capabilitiesFromModelConfig(
   modelConfig: LocalModelConfig | undefined,
 ): LocalModelRefCapabilities {
-  const modalities = modelConfig?.modalities?.input ?? [];
+  const rawConfig = modelConfig as Record<string, unknown> | undefined;
+  const rawModalities = rawConfig?.modalities;
+  let inputModalities: readonly string[] = [];
+  if (Array.isArray(rawModalities)) {
+    inputModalities = rawModalities.filter((item): item is string => typeof item === 'string');
+  } else if (
+    rawModalities &&
+    typeof rawModalities === 'object' &&
+    Array.isArray((rawModalities as { input?: unknown }).input)
+  ) {
+    inputModalities = (rawModalities as { input: readonly string[] }).input;
+  }
+  const supportImage =
+    inputModalities.includes('image') ||
+    modelConfig?.capabilities?.support_image === true ||
+    modelConfig?.attachment === true ||
+    rawConfig?.support_image === true ||
+    rawConfig?.vision === true;
+  const supportVideo =
+    inputModalities.includes('video') ||
+    modelConfig?.capabilities?.support_video === true ||
+    rawConfig?.support_video === true;
   const capabilities: LocalModelRefCapabilities = {
-    support_image:
-      modalities.includes('image') || modelConfig?.capabilities?.support_image === true,
-    support_video:
-      modalities.includes('video') || modelConfig?.capabilities?.support_video === true,
+    support_image: supportImage,
+    support_video: supportVideo,
     ...normalizeLocalFileApiCapabilities(modelConfig?.capabilities),
     ...normalizeLocalMultimodalLimitCapabilities(modelConfig?.capabilities),
     ...(modelConfig?.capabilities?.support_json_object_output === true

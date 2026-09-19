@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { McodeProviderModel, McodeProviderView } from '../../src/provider/contract.js';
 import { McodeProviderApplication } from '../../src/provider/application.js';
+import { runMcodeProviderCommand } from '../../src/cli/provider-command.js';
 
 function createPort() {
   return {
@@ -334,5 +335,74 @@ describe('saved provider model refresh', () => {
     const port = createPort();
     await expect(new McodeProviderApplication(port).refreshModels({ ...provider, configRevision: undefined })).rejects.toThrow('Reopen /provider');
     expect(port.discoverUserModelsCandidate).not.toHaveBeenCalled();
+  });
+
+  it('creates custom provider models with vision capabilities preserved', async () => {
+    const port = createPort();
+    const application = new McodeProviderApplication(port);
+
+    await application.create({
+      name: 'OpenAI-Vision',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'sk-live',
+      apiFormat: 'openai-completions',
+      models: [
+        {
+          modelId: 'gpt-4o',
+          attachment: true,
+          modalities: { input: ['text', 'image'], output: ['text'] },
+          capabilities: { support_image: true },
+        },
+      ],
+    });
+
+    expect(port.createUserModelProvider).toHaveBeenCalledWith({
+      name: 'OpenAI-Vision',
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: 'sk-live',
+      apiFormat: 'openai-completions',
+      models: [
+        {
+          modelId: 'gpt-4o',
+          attachment: true,
+          modalities: { input: ['text', 'image'], output: ['text'] },
+          capabilities: { support_image: true },
+        },
+      ],
+    });
+  });
+
+  it('runMcodeProviderCommand attaches vision modalities and capabilities when supportImage is set', async () => {
+    const port = createPort();
+    const application = new McodeProviderApplication(port);
+    const result = await runMcodeProviderCommand({
+      version: '1.0.0',
+      request: {
+        action: 'add',
+        name: 'Custom Vision',
+        baseUrl: 'https://api.custom.example/v1',
+        apiFormat: 'openai-completions',
+        models: ['custom-vision-1'],
+        supportImage: true,
+      },
+      environment: { MCODE_PROVIDER_API_KEY: 'sk-test' },
+      createContext: async () => ({ application, shutdown: async () => undefined }),
+    });
+
+    expect(result).toBe('Provider added: Custom Vision');
+    expect(port.createUserModelProvider).toHaveBeenCalledWith({
+      name: 'Custom Vision',
+      baseUrl: 'https://api.custom.example/v1',
+      apiKey: 'sk-test',
+      apiFormat: 'openai-completions',
+      models: [
+        {
+          modelId: 'custom-vision-1',
+          attachment: true,
+          modalities: { input: ['text', 'image'], output: ['text'] },
+          capabilities: { support_image: true },
+        },
+      ],
+    });
   });
 });

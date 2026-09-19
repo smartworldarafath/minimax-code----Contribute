@@ -176,11 +176,24 @@ function parseModel(modelId: string, value: unknown): UserModelInputView | undef
 }
 
 function parseModelCapabilities(value: Record<string, unknown>): Partial<UserModelInputView> {
+  const capabilities = isRecord(value.capabilities) ? value.capabilities : undefined;
   return {
     attachment: value.attachment === true,
     reasoning: value.reasoning === true,
     toolCall: true,
     temperature: value.temperature === true,
+    ...(capabilities
+      ? {
+          capabilities: {
+            ...(capabilities.support_image !== undefined
+              ? { support_image: Boolean(capabilities.support_image) }
+              : {}),
+            ...(capabilities.support_video !== undefined
+              ? { support_video: Boolean(capabilities.support_video) }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -212,6 +225,10 @@ function parseModelEffortOptions(value: Record<string, unknown>): Partial<UserMo
 }
 
 function parseModelModalities(value: Record<string, unknown>): Partial<UserModelInputView> {
+  if (Array.isArray(value.modalities)) {
+    const input = stringArray(value.modalities);
+    return input ? { modalities: { input } } : {};
+  }
   const modalities = isRecord(value.modalities) ? value.modalities : undefined;
   const input = stringArray(modalities?.input);
   const output = stringArray(modalities?.output);

@@ -154,6 +154,9 @@ function modelMetadataFields(model: UserModelInputView): Partial<LocalModelConfi
   if (model.temperature !== undefined) fields.temperature = model.temperature;
   if (model.modalities) fields.modalities = model.modalities as LocalModelConfig['modalities'];
   if (limit) fields.limit = limit;
+  if (model.capabilities) {
+    fields.capabilities = model.capabilities as LocalModelConfig['capabilities'];
+  }
   return fields;
 }
 
@@ -224,11 +227,23 @@ function mergeModelInput(
 }
 
 function mergeModelConfig(current: LocalModelConfig, patch: LocalModelConfig): LocalModelConfig {
+  let mergedModalities = patch.modalities;
+  if (
+    current.modalities &&
+    patch.modalities &&
+    !Array.isArray(current.modalities) &&
+    !Array.isArray(patch.modalities)
+  ) {
+    mergedModalities = { ...current.modalities, ...patch.modalities };
+  }
   return {
     ...current,
     ...patch,
     ...(patch.limit ? { limit: { ...current.limit, ...patch.limit } } : {}),
-    ...(patch.modalities ? { modalities: { ...current.modalities, ...patch.modalities } } : {}),
+    ...(patch.modalities !== undefined ? { modalities: mergedModalities } : {}),
+    ...(patch.capabilities
+      ? { capabilities: { ...current.capabilities, ...patch.capabilities } }
+      : {}),
     ...(patch.thinking_config
       ? { thinking_config: { ...current.thinking_config, ...patch.thinking_config } }
       : {}),

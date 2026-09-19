@@ -631,7 +631,7 @@ function buildResolvedModel(scope: {
     baseUrl,
     reasoning: thinking.enabled,
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
-    input: deriveModelInput(input.modelRef),
+    input: deriveModelInput(input.modelRef, input.catalogModel),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
@@ -810,8 +810,10 @@ function requireUsableCredentials(
   return { apiKey, baseUrl };
 }
 
-function deriveModelInput(modelRef: IModelRef): Model<Api>['input'] {
-  return modelRef.capabilities?.support_image || modelRef.capabilities?.support_video
+function deriveModelInput(modelRef: IModelRef, catalogModel?: Model<Api>): Model<Api>['input'] {
+  return modelRef.capabilities?.support_image ||
+    modelRef.capabilities?.support_video ||
+    catalogModel?.input?.includes('image')
     ? ['text', 'image']
     : ['text'];
 }

@@ -16,6 +16,7 @@ export type McodeProviderCliRequest =
       readonly outputLimit?: number;
       readonly apiKeyEnv?: string;
       readonly saveAndUse?: boolean;
+      readonly supportImage?: boolean;
     }
   | { readonly action: 'remove'; readonly providerId: string; readonly confirmed: boolean }
   | {
@@ -73,6 +74,13 @@ export async function runMcodeProviderCommand(
                   ...(request.contextLimit !== undefined ? { context: request.contextLimit } : {}),
                   ...(request.outputLimit !== undefined ? { output: request.outputLimit } : {}),
                 },
+              }
+            : {}),
+          ...(request.supportImage
+            ? {
+                attachment: true,
+                modalities: { input: ['text', 'image'], output: ['text'] },
+                capabilities: { support_image: true },
               }
             : {}),
         })),

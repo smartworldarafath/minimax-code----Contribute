@@ -418,6 +418,11 @@ export interface UserModelInputView {
   limit?: { context?: number; output?: number };
   thinkingConfig?: { mode?: string; defaultValue?: string };
   effortOptions?: string[];
+  capabilities?: {
+    support_image?: boolean;
+    support_video?: boolean;
+    [key: string]: unknown;
+  };
 }
 
 export interface ByokProviderPresetView {

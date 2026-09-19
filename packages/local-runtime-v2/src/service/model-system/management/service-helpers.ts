@@ -24,6 +24,11 @@ export function patchModelParameters(
   return {
     ...model,
     limit: { ...model.limit, ...normalizedPatch.limit },
+    ...(normalizedPatch.capabilities
+      ? { capabilities: { ...model.capabilities, ...normalizedPatch.capabilities } }
+      : {}),
+    ...(normalizedPatch.modalities !== undefined ? { modalities: normalizedPatch.modalities } : {}),
+    ...(normalizedPatch.attachment !== undefined ? { attachment: normalizedPatch.attachment } : {}),
   };
 }
 
