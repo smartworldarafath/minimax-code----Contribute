@@ -26,11 +26,11 @@ const FEISHU_FORMAT: ResponseFormatHint = {
 };
 
 const TELEGRAM_FORMAT: ResponseFormatHint = {
-  text_markup: 'telegram_markdown_v2',
+  text_markup: 'markdown_subset',
   rules: [
-    'Use Telegram MarkdownV2 formatting.',
-    'Escape special characters: _ * [ ] ( ) ~ ` > # + - = | { } . !',
-    'Use ``` for code blocks (no language tag support in some clients).',
+    'Use plain text or basic markdown (bold, italic, code blocks, lists, links).',
+    'Do not escape special characters with backslashes.',
+    'Use ``` for code blocks.',
     'Keep messages under 4096 characters (Telegram limit).',
     'Avoid nested formatting (bold inside italic, etc.).',
   ],
