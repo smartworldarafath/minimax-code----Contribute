@@ -778,6 +778,21 @@ export const UPSTREAM_STATUS_CODE_MAP: Record<number, LLMErrorStatusCode> = {
   2056: LLM_ERROR_CODES.USAGE_LIMIT_EXCEEDED,
   // Token Plan limit reached with automatic credit consumption disabled → 42212.
   2067: LLM_ERROR_CODES.USAGE_LIMIT_EXCEEDED,
+  // Documented MiniMax business codes
+  1000: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1001: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1002: LLM_ERROR_CODES.LLM_RATE_LIMITED,
+  1004: LLM_ERROR_CODES.LLM_AUTH_ERROR,
+  1008: LLM_ERROR_CODES.LLM_CREDITS_EXHAUSTED,
+  1013: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1024: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1026: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1027: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1033: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  1039: LLM_ERROR_CODES.LLM_TPM_RATE_LIMITED,
+  1041: LLM_ERROR_CODES.LLM_TPM_RATE_LIMITED,
+  1042: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
+  2013: LLM_ERROR_CODES.LLM_UPSTREAM_ERROR,
 };
 
 /**
@@ -938,6 +953,17 @@ function extractFromMessageString(s: string): {
     }
   }
 
+  // 3. Extract parenthesized or prefixed business error codes, e.g. "unknown error, 520 (1000)"
+  if (out.errorCode === undefined) {
+    const m = s.match(/(?:\(|\[|\bcode:?\s*)(1\d{3}|2\d{3}|1400010161)(?:\)|\]|\b)/i);
+    if (m) {
+      const code = Number(m[1]);
+      if (Number.isFinite(code)) {
+        out.errorCode = code;
+      }
+    }
+  }
+
   return out;
 }
 
@@ -992,6 +1018,12 @@ export function classifyLLMErrorToCode(
     if (allowed.has(extracted.errorCode)) {
       return {
         status_code: extracted.errorCode as LLMErrorStatusCode,
+        message: extracted.message ?? fallbackMessage(err),
+      };
+    }
+    if (UPSTREAM_STATUS_CODE_MAP[extracted.errorCode]) {
+      return {
+        status_code: UPSTREAM_STATUS_CODE_MAP[extracted.errorCode]!,
         message: extracted.message ?? fallbackMessage(err),
       };
     }
