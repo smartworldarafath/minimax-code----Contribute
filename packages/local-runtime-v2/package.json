@@ -114,7 +114,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "@types/node": "^20",
     "@types/proper-lockfile": "^4",
     "dependency-cruiser": "18.3.1",
