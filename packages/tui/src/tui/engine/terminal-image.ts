@@ -66,6 +66,23 @@ function probeTmuxHyperlinks(): boolean {
 	}
 }
 
+function hasOuterTerminalHyperlinkSupport(termProgram: string, term: string): boolean {
+	if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") return true;
+	if (termProgram === "ghostty" || term.includes("ghostty") || process.env.GHOSTTY_RESOURCES_DIR) return true;
+	if (process.env.WEZTERM_PANE || termProgram === "wezterm") return true;
+	if (termProgram === "warpterminal" || process.env.WARP_SESSION_ID || process.env.WARP_TERMINAL_SESSION_UUID) return true;
+	if (process.env.ITERM_SESSION_ID || termProgram === "iterm.app") return true;
+	if (process.env.WT_SESSION) return true;
+	if (termProgram === "vscode" || termProgram === "alacritty") return true;
+	if (process.env.VTE_VERSION || termProgram === "gnome-terminal") {
+		const vte = process.env.VTE_VERSION ? Number(process.env.VTE_VERSION) : NaN;
+		return Number.isNaN(vte) || vte >= 5000;
+	}
+	if (process.env.KONSOLE_VERSION || termProgram === "konsole") return true;
+	if (process.env.FOOT_TERM || term === "foot" || term.startsWith("foot-")) return true;
+	return false;
+}
+
 function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean): TerminalCapabilities {
 	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
 	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
@@ -74,10 +91,11 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";
 	const isWindowsConsole = process.platform === "win32";
 
-	// Emit OSC 8 hyperlinks only when tmux confirms it forwards.
+	// Emit OSC 8 hyperlinks only when tmux confirms it forwards or the outer terminal supports it.
 	// Image protocols are unreliable under tmux, so leave `images: null`.
 	if (process.env.TMUX || term.startsWith("tmux")) {
-		return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
+		const forwards = tmuxForwardsHyperlink() || hasOuterTerminalHyperlinkSupport(termProgram, term);
+		return { images: null, trueColor: hasTrueColorHint, hyperlinks: forwards };
 	}
 
 	// screen does not forward OSC 8 hyperlinks, so keep them off there.
@@ -115,6 +133,20 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 	}
 
 	if (termProgram === "alacritty") {
+		return { images: null, trueColor: true, hyperlinks: true };
+	}
+
+	if (process.env.VTE_VERSION || termProgram === "gnome-terminal") {
+		const vte = process.env.VTE_VERSION ? Number(process.env.VTE_VERSION) : NaN;
+		const supportsHyperlinks = Number.isNaN(vte) || vte >= 5000;
+		return { images: null, trueColor: true, hyperlinks: supportsHyperlinks };
+	}
+
+	if (process.env.KONSOLE_VERSION || termProgram === "konsole") {
+		return { images: null, trueColor: true, hyperlinks: true };
+	}
+
+	if (process.env.FOOT_TERM || term === "foot" || term.startsWith("foot-")) {
 		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
