@@ -5,8 +5,8 @@ tools:
   - grep
   - glob
   - web_fetch
+  - skill
 builtinTools: []
-skills: []
 features:
   mavis: false
   delegation: false

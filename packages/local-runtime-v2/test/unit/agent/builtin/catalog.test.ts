@@ -1368,6 +1368,16 @@ describe("shipped canonical SubAgent definitions", () => {
       expect(definition.capabilityOverride?.features?.webSearch).toBe(true);
     },
   );
+
+  it.each(["explore", "worker", "verifier"])(
+    "declares the native skill tool for shipped %s",
+    async (name) => {
+      const definition = await new BuiltinAgentCatalog().readDefinition(name);
+
+      expect(definition.capabilityOverride?.tools).toContain("skill");
+      expect(definition.capabilityOverride?.skills).toBeUndefined();
+    },
+  );
 });
 
 describe("BuiltinAgentCatalog prompt modes", () => {

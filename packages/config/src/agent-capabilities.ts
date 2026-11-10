@@ -11,6 +11,7 @@ export const AGENT_BUILTIN_TOOL_IDS = [
   'todowrite',
   'web_fetch',
   'website_deploy',
+  'skill',
 ] as const;
 
 export type AgentBuiltinToolId = (typeof AGENT_BUILTIN_TOOL_IDS)[number];

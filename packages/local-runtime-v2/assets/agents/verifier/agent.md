@@ -8,8 +8,8 @@ tools:
   - task_output
   - task_stop
   - web_fetch
+  - skill
 builtinTools: []
-skills: []
 features:
   mavis: false
   delegation: false
