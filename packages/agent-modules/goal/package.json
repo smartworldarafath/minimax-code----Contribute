@@ -14,7 +14,7 @@
     "@mavis/agent-core": "workspace:^",
     "@sinclair/typebox": "^0.34.0",
     "@earendil-works/pi-agent-core": "workspace:*",
-    "zod": "^3"
+    "zod": "^4"
   },
   "devDependencies": {
     "@types/node": "^20",

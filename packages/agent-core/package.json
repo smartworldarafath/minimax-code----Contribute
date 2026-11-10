@@ -74,7 +74,7 @@
     "@earendil-works/pi-ai": "workspace:*",
     "@earendil-works/pi-coding-agent": "workspace:*",
     "@sinclair/typebox": "^0.34.0",
-    "zod": "^3"
+    "zod": "^4"
   },
   "devDependencies": {
     "@mavis/config": "workspace:^",
