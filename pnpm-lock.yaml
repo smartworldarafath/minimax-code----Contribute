@@ -14,7 +14,7 @@ overrides:
   vitest: 4.1.11
   '@vitest/coverage-v8': 4.1.11
   vite: 7.3.6
-  hono: 4.13.5
+  hono: 4.13.16
 
 importers:
 
@@ -561,8 +561,8 @@ importers:
         specifier: ^4.7.9
         version: 4.7.9
       hono:
-        specifier: 4.13.5
-        version: 4.13.5
+        specifier: 4.13.16
+        version: 4.13.16
       jpeg-js:
         specifier: 0.4.4
         version: 0.4.4
@@ -692,8 +692,8 @@ importers:
         specifier: ^4.7.9
         version: 4.7.9
       hono:
-        specifier: 4.13.5
-        version: 4.13.5
+        specifier: 4.13.16
+        version: 4.13.16
       jszip:
         specifier: ^3.10.1
         version: 3.10.2
@@ -1391,7 +1391,7 @@ packages:
     resolution: {integrity: sha512-eWpQYr67tqJLeaSUl0Q+TquuYfUdTibpOJlUMV2FfUP7+KqCC5TufnwnlXL6mobZBJbGAYRd7ZvEBDCbLInjhg==}
     engines: {node: '>=20'}
     peerDependencies:
-      hono: 4.13.5
+      hono: 4.13.16
 
   '@isaacs/fs-minipass@4.0.1':
     resolution: {integrity: sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==}
@@ -2823,8 +2823,8 @@ packages:
   highlight.js@10.7.3:
     resolution: {integrity: sha512-tzcUFauisWKNHaRkN4Wjl/ZA07gENAjFl3J/c480dprkGTg5EQstgaNFqBfUqCq54kZRIEcreTsAgF/m2quD7A==}
 
-  hono@4.13.5:
-    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
+  hono@4.13.16:
+    resolution: {integrity: sha512-AOLOEhvrV+iH92xXCnFr/5+3KjPKcI3xP63XJtX5spAnkznPdHijlIsUTpi7/9EhWqrTCekw5c5zh1K+YsVw7A==}
     engines: {node: '>=16.9.0'}
 
   hosted-git-info@9.0.3:
@@ -4291,9 +4291,9 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@hono/node-server@2.0.12(hono@4.13.5)':
+  '@hono/node-server@2.0.12(hono@4.13.16)':
     dependencies:
-      hono: 4.13.5
+      hono: 4.13.16
 
   '@isaacs/fs-minipass@4.0.1':
     dependencies:
@@ -4384,7 +4384,7 @@ snapshots:
 
   '@modelcontextprotocol/sdk@1.32.0(zod@3.25.76)':
     dependencies:
-      '@hono/node-server': 2.0.12(hono@4.13.5)
+      '@hono/node-server': 2.0.12(hono@4.13.16)
       ajv: 8.18.0
       ajv-formats: 3.0.1(ajv@8.18.0)
       content-type: 1.0.5
@@ -4394,7 +4394,7 @@ snapshots:
       eventsource-parser: 3.1.1
       express: 5.3.0
       express-rate-limit: 8.7.3(express@5.3.0)
-      hono: 4.13.5
+      hono: 4.13.16
       jose: 6.2.17
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
@@ -4406,7 +4406,7 @@ snapshots:
 
   '@modelcontextprotocol/sdk@1.32.0(zod@4.6.2)':
     dependencies:
-      '@hono/node-server': 2.0.12(hono@4.13.5)
+      '@hono/node-server': 2.0.12(hono@4.13.16)
       ajv: 8.18.0
       ajv-formats: 3.0.1(ajv@8.18.0)
       content-type: 1.0.5
@@ -4416,7 +4416,7 @@ snapshots:
       eventsource-parser: 3.1.1
       express: 5.3.0
       express-rate-limit: 8.7.3(express@5.3.0)
-      hono: 4.13.5
+      hono: 4.13.16
       jose: 6.2.17
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
@@ -5566,7 +5566,7 @@ snapshots:
 
   highlight.js@10.7.3: {}
 
-  hono@4.13.5: {}
+  hono@4.13.16: {}
 
   hosted-git-info@9.0.3:
     dependencies:

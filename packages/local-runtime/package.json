@@ -31,7 +31,7 @@
     "croner": "^9",
     "diff": "^8.0.4",
     "handlebars": "^4.7.9",
-    "hono": "^4.7.11",
+    "hono": "^4.13.16",
     "jszip": "^3.10.1",
     "lazystream": "^1.0.1",
     "js-yaml": "^4",

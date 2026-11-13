@@ -106,7 +106,7 @@
     "croner": "^9",
     "drizzle-orm": "^0.45.2",
     "handlebars": "^4.7.9",
-    "hono": "^4.7.11",
+    "hono": "^4.13.16",
     "jszip": "^3.10.1",
     "proper-lockfile": "^4",
     "typebox": "1.1.38",
