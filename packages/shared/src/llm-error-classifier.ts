@@ -326,7 +326,7 @@ export function isLLMDeterministicRequestRejection(normalized: NormalizedLLMErro
  * retried.
  * Anything that also looks transient (timeout, network, 408/429/5xx) is excluded.
  */
-function isLLMRequestOversized(normalized: NormalizedLLMError): boolean {
+export function isLLMRequestOversized(normalized: NormalizedLLMError): boolean {
   const { facts } = normalized;
   if (facts.explicitAbort || facts.timeout || facts.signals.has('network')) return false;
   if (facts.signals.has('tpm_rate_limit')) return false;

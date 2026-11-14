@@ -125,6 +125,37 @@ export function buildMiddleDeletionCandidate(
 }
 
 /**
+ * Drops oldest closures until `fits` accepts a valid recent suffix.
+ * Used during recovery when protected user closures prevent middle deletion.
+ */
+export function buildRecoverySuffixCandidate(
+  messages: readonly AgentMessage[],
+  fits: (messages: readonly AgentMessage[]) => boolean,
+  minDropClosures = 1,
+): readonly AgentMessage[] | undefined {
+  const closures = buildHistoryClosures(messages);
+  if (closures.length <= 1) return undefined;
+  const startMin = Math.min(Math.max(1, minDropClosures), closures.length - 1);
+  for (let start = startMin; start < closures.length; start += 1) {
+    const firstIndex = closures[start]?.messageIndexes[0];
+    if (firstIndex === undefined) continue;
+    const candidate = messages.slice(firstIndex);
+    parseToolRounds(candidate);
+    if (fits(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function buildHalvedSuffixCandidate(
+  messages: readonly AgentMessage[],
+  fits: (messages: readonly AgentMessage[]) => boolean,
+): readonly AgentMessage[] | undefined {
+  const closures = buildHistoryClosures(messages);
+  if (closures.length <= 1) return undefined;
+  return buildRecoverySuffixCandidate(messages, fits, Math.ceil(closures.length / 2));
+}
+
+/**
  * The irreducible remainder of middle deletion: closure 0 plus every closure
  * containing a user message. Used for content-free failure diagnostics only.
  */

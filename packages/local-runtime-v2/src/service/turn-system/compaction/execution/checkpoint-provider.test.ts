@@ -708,6 +708,74 @@ describe('checkpoint Provider output exhaustion', () => {
   });
 });
 
+describe('checkpoint Provider context overflow normalization', () => {
+  it.each([
+    [
+      'thrown MiniMax 2013 overflow Error',
+      () => {
+        throw new Error('400 invalid params, context window exceeds limit (2013)');
+      },
+    ],
+    [
+      'wrapped MiniMax 2013 overflow object',
+      () => {
+        throw { error: { message: '400 invalid params, context window exceeds limit (2013)' } };
+      },
+    ],
+    [
+      'stream error stopReason with MiniMax 2013 overflow message',
+      () =>
+        completedStream(
+          assistant({
+            stopReason: 'error',
+            errorMessage: '400 invalid params, context window exceeds limit (2013)',
+          }),
+        ),
+    ],
+    [
+      'thrown Anthropic prompt-too-long Error',
+      async () => {
+        throw new Error('prompt is too long: 980000 tokens > 950000 maximum');
+      },
+    ],
+  ])('normalizes %s to CheckpointCandidateTooLargeError', async (_label, respond) => {
+    const streamFn: StreamFn = vi.fn(async () => respond());
+    const session = await createCheckpointSession({
+      model: model(1_000_000),
+      streamFn,
+      maxOutputTokens: 256,
+      providerInputLimit: 950_000,
+    });
+
+    await expect(session.generate({ messages: [user('context', 1)] })).rejects.toBeInstanceOf(
+      CheckpointCandidateTooLargeError,
+    );
+  });
+
+  it.each([
+    ['bare error code 2013', Object.assign(new Error('Error code: 2013'), { status: 400 })],
+    [
+      '429 rate limit with overflow phrasing',
+      Object.assign(new Error('429 prompt is too long rate limit reached'), { status: 429 }),
+    ],
+    ['503 transient failure', Object.assign(new Error('503 Service unavailable'), { status: 503 })],
+  ])('preserves non-overflow failure (%s) without converting to candidate overflow', async (_label, err) => {
+    const streamFn: StreamFn = vi.fn(async () => {
+      throw err;
+    });
+    const session = await createCheckpointSession({
+      model: model(1_000_000),
+      streamFn,
+      maxOutputTokens: 256,
+      providerInputLimit: 950_000,
+    });
+
+    const caught = await session.generate({ messages: [user('context', 1)] }).catch((e) => e);
+    expect(caught).toBe(err);
+    expect(caught).not.toBeInstanceOf(CheckpointCandidateTooLargeError);
+  });
+});
+
 function model(contextWindow = 128_000): Parameters<StreamFn>[0] {
   return {
     id: 'selected-model',

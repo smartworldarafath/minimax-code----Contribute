@@ -5,11 +5,19 @@ import {
   type AssistantMessageEventStream,
   type Model,
 } from "@earendil-works/pi-ai";
+import {
+  PiTurnRunner,
+  type PiBeforeLlmCallHookInput,
+} from "@mavis/agent-core/pi-turn-runner";
+import { RuntimeEventStatus, type RuntimeEvent } from "@mavis/agent-core/protocol";
+import { createAgentRuntime } from "@mavis/agent-runtime";
+import { requestMediaExtension } from "@mavis/agent-extension";
 import { resolveCompactionTokenBudget } from "@mavis/context-manager";
 import { wrapInternalContext } from "@mavis/goal";
 import type { PromptReadSnapshot } from "@mavis/agent-runtime";
 import { describe, expect, it, vi } from "vitest";
 
+import { withLocalDynamicMaxTokens } from "../../model-system/resolution/dynamic-max-tokens.js";
 import { buildLocalRequestPayloadTransform } from "../agent-host/assembly/local-turn-payload-transform.js";
 import { createAutomaticContextCompactionHook } from "../agent-host/compaction/context-compaction.js";
 import { readCompactionCompatibility } from "./compat.js";
@@ -50,6 +58,424 @@ function automaticCompactor(
     dependencies,
   );
 }
+
+describe("issue 539 context overflow and persisted usage recovery", () => {
+  const m3Flash: Model<"anthropic-messages"> = {
+    id: "MiniMax-M3.1-Flash",
+    name: "MiniMax-M3.1-Flash",
+    api: "anthropic-messages",
+    provider: "minimax",
+    baseUrl: "https://example.invalid",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  };
+
+  function settledAssistantWithTokens(
+    totalTokens: number,
+    timestamp: number,
+    overrides: Partial<AssistantMessage> = {},
+  ): AssistantMessage {
+    return {
+      role: "assistant",
+      content: [{ type: "text", text: "settled turn reply" }],
+      api: m3Flash.api,
+      provider: m3Flash.provider,
+      model: m3Flash.id,
+      usage: {
+        input: Math.max(0, totalTokens - 1_000),
+        output: 1_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp,
+      ...overrides,
+    };
+  }
+
+  it("recovers persisted assistant usage on a cold ContextUsageAnchorState for untouched scope", () => {
+    const compactor = automaticCompactor(new ContextUsageAnchorState());
+    const messages: AgentMessage[] = [
+      { role: "user", content: [{ type: "text", text: "first ask" }], timestamp: 1 },
+      settledAssistantWithTokens(920_573, 2),
+      { role: "user", content: [{ type: "text", text: "continue" }], timestamp: 3 },
+    ];
+
+    expect(
+      compactor.probeBeforeLlm({
+        sessionId: "session-cold-92pct",
+        phase: "initial",
+        messages,
+        model: m3Flash,
+        maxTokens: 128_000,
+        thinkingLevel: "high",
+      }),
+    ).toEqual({ shouldStart: true });
+  });
+
+  it("does not cross compactionSummary, model switches, errored assistants, or invalidated scopes on cold start", () => {
+    const anchorState = new ContextUsageAnchorState();
+    const compactor = automaticCompactor(anchorState);
+    const messagesAcrossCheckpoint: AgentMessage[] = [
+      settledAssistantWithTokens(920_573, 1),
+      { role: "compactionSummary", summary: "checkpoint", tokensBefore: 920_573, timestamp: 2 },
+      { role: "user", content: [{ type: "text", text: "after checkpoint" }], timestamp: 3 },
+    ];
+    expect(
+      compactor.probeBeforeLlm({
+        sessionId: "session-post-checkpoint",
+        phase: "initial",
+        messages: messagesAcrossCheckpoint,
+        model: m3Flash,
+        thinkingLevel: "off",
+      }),
+    ).toEqual({ shouldStart: false });
+
+    const messagesWrongModel: AgentMessage[] = [
+      settledAssistantWithTokens(920_573, 1, { model: "other-model" }),
+      { role: "user", content: [{ type: "text", text: "switched model" }], timestamp: 2 },
+    ];
+    expect(
+      compactor.probeBeforeLlm({
+        sessionId: "session-model-switch",
+        phase: "initial",
+        messages: messagesWrongModel,
+        model: m3Flash,
+        thinkingLevel: "off",
+      }),
+    ).toEqual({ shouldStart: false });
+
+    const messagesErrored: AgentMessage[] = [
+      settledAssistantWithTokens(920_573, 1, { stopReason: "error" }),
+      { role: "user", content: [{ type: "text", text: "retry" }], timestamp: 2 },
+    ];
+    expect(
+      compactor.probeBeforeLlm({
+        sessionId: "session-errored-assistant",
+        phase: "initial",
+        messages: messagesErrored,
+        model: m3Flash,
+        thinkingLevel: "off",
+      }),
+    ).toEqual({ shouldStart: false });
+
+    anchorState.invalidate("session-invalidated");
+    expect(
+      compactor.probeBeforeLlm({
+        sessionId: "session-invalidated",
+        phase: "initial",
+        messages: [
+          settledAssistantWithTokens(920_573, 1),
+          { role: "user", content: [{ type: "text", text: "after trim" }], timestamp: 2 },
+        ],
+        model: m3Flash,
+        thinkingLevel: "off",
+      }),
+    ).toEqual({ shouldStart: false });
+  });
+
+  it("enforces recoveryDivisor when recovering from MiniMax 2013 under providerInputLimit and steps down on thrown 2013", async () => {
+    const measurer = createLocalContextFootprintMeasurer({ model: m3Flash });
+    const roundMessages: AgentMessage[] = Array.from({ length: 6 }, (_, index) => {
+      const id = `call-${index + 1}`;
+      return [
+        {
+          role: "assistant" as const,
+          content: [{ type: "text" as const, text: `summary-${index}: ` + "k".repeat(4_000) }],
+          api: m3Flash.api,
+          provider: m3Flash.provider,
+          model: m3Flash.id,
+          usage: {
+            input: 100,
+            output: 20,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 120,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop" as const,
+          timestamp: index * 2 + 1,
+        },
+        {
+          role: "user" as const,
+          content: [{ type: "text" as const, text: `turn-${id}: ` + "u".repeat(4_000) }],
+          timestamp: index * 2 + 2,
+        },
+      ];
+    }).flat();
+
+    const rejectedTokens = measurer.measure(roundMessages).inputTokens;
+    const seenTokenCounts: number[] = [];
+    let attempt = 0;
+    const streamFn: StreamFn = vi.fn(async (_model, context) => {
+      attempt += 1;
+      seenTokenCounts.push(context.messages.length);
+      if (attempt === 1) {
+        throw new Error("400 invalid params, context window exceeds limit (2013)");
+      }
+      const stream = createAssistantMessageEventStream();
+      stream.push({
+        type: "done",
+        reason: "stop",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: CHECKPOINT_TRANSPORT_SUMMARY }],
+          api: m3Flash.api,
+          provider: m3Flash.provider,
+          model: m3Flash.id,
+          usage: {
+            input: 500,
+            output: 80,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 580,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 99,
+        },
+      });
+      return stream;
+    });
+
+    const outcome = await automaticCompactor(undefined, undefined, undefined, {
+      getRecoveryDivisor: () => 2,
+    }).compactBeforeLlm({
+      sessionId: "session-recovery-divisor",
+      phase: "initial",
+      messages: roundMessages,
+      model: m3Flash,
+      streamFn,
+      thinkingLevel: "off",
+      recovery: {
+        reason: "request_media",
+        errorMessage: "400 invalid params, context window exceeds limit (2013)",
+        requestMessages: roundMessages,
+      },
+    });
+
+    expect(outcome.status).toBe("completed");
+    if (outcome.status === "completed") {
+      expect(seenTokenCounts[0]).toBeLessThanOrEqual(roundMessages.length / 2 + 1);
+      expect(measurer.measure(outcome.replacementMessages).inputTokens).toBeLessThanOrEqual(
+        Math.ceil(rejectedTokens / 2),
+      );
+    }
+  });
+
+  it("recovers a near-limit M3.1-Flash turn from MiniMax 2013 end-to-end with PiTurnRunner and dynamic maxTokens", async () => {
+    const usageAnchor = new ContextUsageAnchorState();
+    const compactor = automaticCompactor(usageAnchor);
+    const seenCalls: Array<{ messageCount: number; maxTokens: number | undefined }> = [];
+    let failFirstModelCall = true;
+    let firstCheckpointCall = true;
+
+    const rawStreamFn: StreamFn = vi.fn(async (_model, context, options) => {
+      const isCheckpoint =
+        (typeof context.systemPrompt === "string" &&
+          context.systemPrompt.includes("loss-aware checkpoint")) ||
+        context.messages.some(
+          (msg) =>
+            msg.role === "user" &&
+            typeof msg.content !== "string" &&
+            msg.content.some(
+              (part) =>
+                part.type === "text" &&
+                part.text.includes("Checkpoint control:"),
+            ),
+        );
+
+      if (isCheckpoint) {
+        if (firstCheckpointCall) {
+          firstCheckpointCall = false;
+          throw new Error("400 invalid params, context window exceeds limit (2013)");
+        }
+        expect(options?.maxTokens).toBeGreaterThanOrEqual(1_024);
+        const stream = createAssistantMessageEventStream();
+        stream.push({
+          type: "done",
+          reason: "stop",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: CHECKPOINT_TRANSPORT_SUMMARY }],
+            api: m3Flash.api,
+            provider: m3Flash.provider,
+            model: m3Flash.id,
+            usage: {
+              input: 600,
+              output: 90,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 690,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 900,
+          },
+        });
+        return stream;
+      }
+
+      seenCalls.push({
+        messageCount: context.messages.length,
+        maxTokens: options?.maxTokens,
+      });
+
+      const stream = createAssistantMessageEventStream();
+      if (failFirstModelCall) {
+        failFirstModelCall = false;
+        stream.push({
+          type: "error",
+          reason: "error",
+          error: {
+            role: "assistant",
+            content: [],
+            api: m3Flash.api,
+            provider: m3Flash.provider,
+            model: m3Flash.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            errorMessage: "400 invalid params, context window exceeds limit (2013)",
+            timestamp: 901,
+          },
+        });
+        return stream;
+      }
+
+      stream.push({
+        type: "done",
+        reason: "stop",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Recovered and finished the task." }],
+          api: m3Flash.api,
+          provider: m3Flash.provider,
+          model: m3Flash.id,
+          usage: {
+            input: 4_000,
+            output: 20,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 4_020,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 902,
+        },
+      });
+      return stream;
+    });
+
+    const streamFn = withLocalDynamicMaxTokens(rawStreamFn);
+    const history: AgentMessage[] = Array.from({ length: 6 }, (_, index) => {
+      const ts = index * 2 + 1;
+      const isLastAssistant = index === 5;
+      return [
+        {
+          role: "user" as const,
+          content: [{ type: "text" as const, text: `step-${index}: ` + "q".repeat(3_500) }],
+          timestamp: ts,
+        },
+        settledAssistantWithTokens(isLastAssistant ? 820_000 : 100_000 * (index + 1), ts + 1),
+      ];
+    }).flat();
+
+    const runtime = await createAgentRuntime({
+      base: [requestMediaExtension()],
+    });
+    const assembly = await runtime.assembleTurn({
+      sessionId: "session-e2e-2013",
+      turnId: "turn-e2e-2013",
+      agentName: "main",
+      workspaceDir: process.cwd(),
+      agentConfig: {},
+      model: {},
+      history: {
+        length: history.length,
+        lastUserMessage: "please finish the task",
+        messages: history as never,
+      },
+      userInput: { text: "please finish the task" },
+    });
+
+    const lifecycle = {
+      completeCommittedHistory: vi.fn(async () => undefined),
+      failCommittedHistory: vi.fn(async () => undefined),
+    };
+    const compactionHook = createAutomaticContextCompactionHook(
+      { automatic: compactor, lifecycle },
+      { sessionId: "session-e2e-2013", turnId: "turn-e2e-2013", turnSequence: 1 },
+      "lease-e2e-2013",
+      {
+        streamFn,
+      },
+    );
+    const mediaGuardHook = createRequestMediaGuardHook();
+    const events: RuntimeEvent[] = [];
+
+    await new PiTurnRunner().runTurn({
+      sessionId: "session-e2e-2013",
+      turnId: "turn-e2e-2013",
+      workspaceDir: process.cwd(),
+      systemPrompt: "You are helpful.",
+      userMessage: { text: "please finish the task", timestamp: 500 },
+      history,
+      llm: {
+        model: m3Flash,
+        apiKey: "synthetic",
+        streamFn,
+        maxTokens: 128_000,
+      },
+      llmRetry: { policy: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 } },
+      eventWriter: {
+        pushRuntime: (event) => {
+          events.push(event);
+        },
+        appendEvents: (batch) => {
+          events.push(...batch);
+        },
+      },
+      toolConfig: { tools: [], disableBuiltinToolFallback: true, context: {} as never },
+      hooks: {
+        beforeLlmCallHook: [
+          async (input: PiBeforeLlmCallHookInput) => {
+            const compacted = await compactionHook(input);
+            if (compacted && compacted.type === "replaceMessages") {
+              return compacted;
+            }
+            return mediaGuardHook(input);
+          },
+        ],
+        afterLlmCallHook: assembly.hooks.afterLlmCallHook,
+      },
+    });
+
+    const terminal = events.findLast(
+      (event) =>
+        event.payload &&
+        typeof event.payload === "object" &&
+        "status" in event.payload &&
+        event.payload.status !== undefined,
+    );
+    expect(terminal?.payload).toMatchObject({ status: RuntimeEventStatus.COMPLETED });
+    expect(firstCheckpointCall).toBe(false);
+    expect(seenCalls).toHaveLength(2);
+    expect(seenCalls[0]?.maxTokens).toBeLessThanOrEqual(1_000_000 - 2_048 - 820_000);
+    expect(seenCalls[1]?.messageCount).toBeLessThan(seenCalls[0]!.messageCount);
+  });
+});
 
 const CHECKPOINT_TRANSPORT_SUMMARY = `## Goal
 Preserve the request.

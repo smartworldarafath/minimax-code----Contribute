@@ -1,10 +1,37 @@
-import { streamSimple, type Api, type Context, type Model } from '@earendil-works/pi-ai';
+import { streamSimple, type Api, type AssistantMessage, type Context, type Model } from '@earendil-works/pi-ai';
 import type { AgentMessage, StreamFn } from '@earendil-works/pi-agent-core';
 import { LLM_RETRY_CALL_IDENTITY } from '@mavis/agent-core/pi-turn-runner';
-import { createDefaultTokenEstimator, resolveDynamicMaxTokens } from '@mavis/context-manager';
+import {
+  createDefaultTokenEstimator,
+  DEFAULT_CONTEXT_MANAGER_SETTINGS,
+  resolveDynamicMaxTokens,
+} from '@mavis/context-manager';
 
 const MIN_OUTPUT_TOKENS = 1_024;
 const EMERGENCY_OUTPUT_TOKENS = 1;
+const prunedContextMessageLists = new WeakSet<readonly unknown[]>();
+const prunedCheckpointHistories = new WeakSet<readonly unknown[]>();
+const staleUsageAssistants = new WeakSet<object>();
+
+export function markPrunedContextMessages(messages: readonly unknown[]): void {
+  prunedContextMessageLists.add(messages);
+}
+
+export function markPrunedCheckpointHistory(messages: readonly unknown[]): void {
+  prunedCheckpointHistories.add(messages);
+}
+
+export function isPrunedCheckpointHistory(messages: readonly unknown[]): boolean {
+  return prunedCheckpointHistories.has(messages);
+}
+
+export function markStaleAssistantUsage(messages: readonly AgentMessage[]): void {
+  for (const message of messages) {
+    if (message && typeof message === 'object' && message.role === 'assistant') {
+      staleUsageAssistants.add(message);
+    }
+  }
+}
 const PI_DEFAULT_THINKING_BUDGETS: Readonly<Record<string, number>> = {
   minimal: 1_024,
   low: 2_048,
@@ -25,9 +52,10 @@ interface BudgetedCall {
   readonly budget: DynamicBudget;
 }
 
-function estimatePiContextTokens(context: Context): number {
+function estimatePiContextTokens(model: Model<Api>, context: Context): number {
   const estimator = createDefaultTokenEstimator();
-  const messages = [...(context.messages ?? [])] as AgentMessage[];
+  const rawMessages = context.messages ?? [];
+  const messages = [...rawMessages] as AgentMessage[];
   const systemTokens = context.systemPrompt
     ? estimator.estimateTextTokens(context.systemPrompt)
     : 0;
@@ -39,7 +67,56 @@ function estimatePiContextTokens(context: Context): number {
       ),
     0,
   );
-  return estimator.estimateMessages(messages) + systemTokens + toolTokens;
+  const bpeTotal = estimator.estimateMessages(messages) + systemTokens + toolTokens;
+  if (prunedContextMessageLists.has(rawMessages)) {
+    return bpeTotal;
+  }
+  const anchored = resolvePersistedContextUsage(model, messages);
+  if (!anchored) {
+    return bpeTotal;
+  }
+  return Math.max(bpeTotal, anchored.absoluteTokens + estimator.estimateMessages(anchored.trailing));
+}
+
+function resolvePersistedContextUsage(
+  model: Model<Api>,
+  messages: readonly AgentMessage[],
+): { readonly absoluteTokens: number; readonly trailing: AgentMessage[] } | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || typeof message !== 'object') continue;
+    if ((message as { role?: string }).role === 'compactionSummary') return undefined;
+    if (message.role !== 'assistant') continue;
+    if (staleUsageAssistants.has(message)) continue;
+    const assistant = message as AssistantMessage;
+    if (
+      assistant.provider !== model.provider ||
+      assistant.api !== model.api ||
+      assistant.model !== model.id ||
+      assistant.stopReason === 'error' ||
+      assistant.stopReason === 'aborted'
+    ) {
+      continue;
+    }
+    const absoluteTokens = readSettledAssistantTokens(assistant.usage);
+    if (absoluteTokens === undefined) continue;
+    return {
+      absoluteTokens,
+      trailing: messages.slice(index + 1),
+    };
+  }
+  return undefined;
+}
+
+function readSettledAssistantTokens(usage: AssistantMessage['usage'] | undefined): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const valid = (n: unknown): number =>
+    typeof n === 'number' && Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  const total = valid(usage.totalTokens);
+  if (total > 0) return total;
+  const components =
+    valid(usage.input) + valid(usage.cacheRead) + valid(usage.cacheWrite) + valid(usage.output);
+  return components > 0 ? components : undefined;
 }
 
 /**
@@ -78,19 +155,35 @@ function resolveCallBudget(input: {
   readonly configured: number;
 }): DynamicBudget {
   try {
+    const estimated = estimatePiContextTokens(input.model, input.context);
     const desired = resolveDynamicMaxTokens({
       contextWindow: input.contextWindow,
       configuredMaxTokens: input.configured,
-      estimatedContextTokens: estimatePiContextTokens(input.context),
+      estimatedContextTokens: estimated,
     });
-    if (desired >= input.configured) {
+    const available = Math.max(
+      0,
+      input.contextWindow - DEFAULT_CONTEXT_MANAGER_SETTINGS.safetyMarginTokens - estimated,
+    );
+    const ceiling = Math.floor(Math.min(desired, available));
+    if (ceiling >= desired && desired >= input.configured) {
       return { maxTokens: input.configured, disableReasoning: false };
     }
+    if (ceiling < MIN_OUTPUT_TOKENS) {
+      return {
+        maxTokens: Math.max(EMERGENCY_OUTPUT_TOKENS, ceiling),
+        disableReasoning: true,
+      };
+    }
+    const thinkingBudget = thinkingBudgetTokens(input.model, input.options);
+    if (thinkingBudget > 0 && ceiling - thinkingBudget < MIN_OUTPUT_TOKENS) {
+      return {
+        maxTokens: ceiling,
+        disableReasoning: true,
+      };
+    }
     return {
-      maxTokens: Math.max(
-        MIN_OUTPUT_TOKENS,
-        desired - thinkingBudgetTokens(input.model, input.options),
-      ),
+      maxTokens: Math.max(MIN_OUTPUT_TOKENS, ceiling - thinkingBudget),
       disableReasoning: false,
     };
   } catch {

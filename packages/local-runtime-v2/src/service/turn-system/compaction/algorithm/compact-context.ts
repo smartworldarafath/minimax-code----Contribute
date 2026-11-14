@@ -27,9 +27,11 @@ import {
 import {
   buildAllToolResultsCandidate,
   buildAttachmentFreeCandidate,
+  buildHalvedSuffixCandidate,
   buildMiddleDeletionCandidate,
   buildMinimalGenuineQueryCandidate,
   buildProtectedSkeletonCandidate,
+  buildRecoverySuffixCandidate,
   buildToolTrimCandidate,
   type ToolTrimCandidate,
 } from './history-reduction.js';
@@ -39,6 +41,10 @@ import {
   type PairedContextFootprint,
   type ToolTrimLimits,
 } from './tool-trim-admission.js';
+import {
+  markPrunedCheckpointHistory,
+  markStaleAssistantUsage,
+} from '../../../model-system/resolution/dynamic-max-tokens.js';
 import type { ToolResultCompactionCandidate } from './tool-result-archiver.js';
 
 export interface CompactContextInput {
@@ -97,6 +103,8 @@ interface CheckpointRequestInput {
 export interface CheckpointSession {
   readonly maxOutputTokens: number;
   readonly fits: (input: Omit<CheckpointRequestInput, 'signal'>) => boolean;
+  /** Stricter recovery-only fit target before falling back to `fits` and `Hmin`. */
+  readonly fitsRecoveryTarget?: (input: Omit<CheckpointRequestInput, 'signal'>) => boolean;
   /** Optional failure-path sizing probe; never used for candidate selection. */
   readonly measure?: (input: Omit<CheckpointRequestInput, 'signal'>) => {
     readonly inputTokens: number;
@@ -136,7 +144,10 @@ export async function compactContext(input: CompactContextInput): Promise<Compac
   const instructions = input.instructions?.trim() || undefined;
   const planning = await planCompaction(input, instructions);
   input.signal?.throwIfAborted();
-  if (planning.decision) return planning.decision;
+  if (planning.decision) {
+    markStaleAssistantUsage(planning.decision.replacementMessages);
+    return planning.decision;
+  }
 
   const generated = await generateCheckpoint(input, planning.candidate, instructions);
   input.signal?.throwIfAborted();
@@ -172,6 +183,7 @@ export async function compactContext(input: CompactContextInput): Promise<Compac
       { diagnostics: postAdmissionDiagnostics(input, measurement) },
     );
   }
+  markStaleAssistantUsage(replacementMessages);
   return {
     method: 'llm_checkpoint',
     replacementMessages,
@@ -389,12 +401,14 @@ async function generateCheckpoint(
     ? { ...candidate, messages: await describeImages(candidate.messages) }
     : undefined;
   const { checkpointCandidates, hall } = buildCheckpointCandidates(history, described);
+  const candidateFits = session.fitsRecoveryTarget ?? session.fits;
   const counter = { value: 0 };
   let overflow: CheckpointCandidateTooLargeError | undefined;
+  let overflowedMessages: readonly AgentMessage[] | undefined;
 
   for (const checkpointCandidate of checkpointCandidates) {
     input.signal?.throwIfAborted();
-    if (!session.fits(checkpointRequest(input, checkpointCandidate.messages, instructions))) {
+    if (!candidateFits(checkpointRequest(input, checkpointCandidate.messages, instructions))) {
       continue;
     }
     try {
@@ -431,6 +445,7 @@ async function generateCheckpoint(
       }
       if (!(cause instanceof CheckpointCandidateTooLargeError)) throw cause;
       overflow = cause;
+      overflowedMessages = checkpointCandidate.messages;
     }
   }
 
@@ -438,9 +453,11 @@ async function generateCheckpoint(
     input,
     session,
     hallMessages: hall.messages,
+    fallbackCandidates: checkpointCandidates,
     instructions,
     counter,
     priorOverflow: overflow,
+    ...(overflowedMessages === undefined ? {} : { overflowedMessages }),
   });
 }
 
@@ -536,9 +553,11 @@ async function recoverAfterMediaRejection({
   const attachmentFree = buildAttachmentFreeCandidate(rejectedMessages);
   if (attachmentFree.replacedBlockCount === 0) throw mediaRejectedProviderFailure(cause);
   let overflow = priorOverflow;
+  let overflowedMessages: readonly AgentMessage[] | undefined;
   let attachmentFreeAttempted = false;
+  const candidateFits = session.fitsRecoveryTarget ?? session.fits;
   try {
-    if (session.fits(checkpointRequest(input, attachmentFree.messages, instructions))) {
+    if (candidateFits(checkpointRequest(input, attachmentFree.messages, instructions))) {
       attachmentFreeAttempted = true;
       try {
         const settled = await generateCandidateWithProviderRetry({
@@ -558,6 +577,7 @@ async function recoverAfterMediaRejection({
       } catch (next) {
         if (!(next instanceof CheckpointCandidateTooLargeError)) throw next;
         overflow = next;
+        overflowedMessages = attachmentFree.messages;
       }
     }
     return await recoverAfterHall({
@@ -567,6 +587,7 @@ async function recoverAfterMediaRejection({
       instructions,
       counter,
       priorOverflow: overflow,
+      ...(overflowedMessages === undefined ? {} : { overflowedMessages }),
       // Do not send the same attachment-free history twice.
       skipHvideo: attachmentFreeAttempted && !hallIsDistinct,
     });
@@ -601,17 +622,24 @@ async function recoverAfterHall({
   input,
   session,
   hallMessages,
+  fallbackCandidates = [],
   instructions,
   counter,
   priorOverflow,
+  overflowedMessages,
   skipHvideo = false,
 }: {
   readonly input: CompactContextInput;
   readonly session: CheckpointSession;
   readonly hallMessages: readonly AgentMessage[];
+  readonly fallbackCandidates?: ReadonlyArray<{
+    readonly candidate: CheckpointCandidate;
+    readonly messages: readonly AgentMessage[];
+  }>;
   readonly instructions: string | undefined;
   readonly counter: { value: number };
   readonly priorOverflow: CheckpointCandidateTooLargeError | undefined;
+  readonly overflowedMessages?: readonly AgentMessage[];
   readonly skipHvideo?: boolean;
 }): Promise<{
   readonly generation: CheckpointGeneration;
@@ -621,54 +649,33 @@ async function recoverAfterHall({
   readonly tokenUsage?: CompactionTokenUsage;
 }> {
   input.signal?.throwIfAborted();
+  const candidateFits = session.fitsRecoveryTarget ?? session.fits;
   const hvideo = buildAttachmentFreeCandidate(hallMessages);
   let overflow = priorOverflow;
+  let lastOverflowed = overflowedMessages;
   if (
     !skipHvideo &&
     hvideo.replacedBlockCount > 0 &&
-    session.fits(checkpointRequest(input, hvideo.messages, instructions))
+    candidateFits(checkpointRequest(input, hvideo.messages, instructions))
   ) {
-    input.signal?.throwIfAborted();
-    try {
-      const settled = await generateCandidateWithProviderRetry({
-        input,
-        session,
-        candidate: 'hvideo',
-        counter,
-        messages: hvideo.messages,
-        instructions,
-      });
-      return {
-        generation: settled.generation,
-        attempts: settled.attemptNumber,
-        maxOutputTokens: session.maxOutputTokens,
-        ...tokenUsageMetadata(input.checkpoint.getTokenUsage?.()),
-      };
-    } catch (cause) {
-      if (!(cause instanceof CheckpointCandidateTooLargeError)) throw cause;
-      overflow = cause;
-    }
+    const attempt = await tryCandidateGeneration({
+      input,
+      session,
+      candidate: 'hvideo',
+      counter,
+      messages: hvideo.messages,
+      instructions,
+    });
+    if ('settled' in attempt) return attempt.settled;
+    overflow = attempt.overflow;
+    lastOverflowed = attempt.overflowedMessages;
   }
 
   const hmid = buildMiddleDeletionCandidate(hvideo.messages, (messages) =>
-    session.fits(checkpointRequest(input, messages, instructions)),
+    candidateFits(checkpointRequest(input, messages, instructions)),
   );
-  if (!hmid) {
-    // No middle-deletion combination fits locally, including the protected
-    // skeleton. Hmin stays the last resort instead of failing closed here.
-    return generateHminCheckpoint({
-      input,
-      session,
-      attachmentFreeMessages: hvideo.messages,
-      instructions,
-      counter,
-      overflow,
-    });
-  }
-
-  input.signal?.throwIfAborted();
-  try {
-    const settled = await generateCandidateWithProviderRetry({
+  if (hmid) {
+    const hmidAttempt = await tryCandidateGeneration({
       input,
       session,
       candidate: 'hmid',
@@ -676,17 +683,37 @@ async function recoverAfterHall({
       messages: hmid,
       instructions,
     });
-    return {
-      generation: settled.generation,
-      attempts: settled.attemptNumber,
-      maxOutputTokens: session.maxOutputTokens,
-      ...tokenUsageMetadata(input.checkpoint.getTokenUsage?.()),
-    };
-  } catch (cause) {
-    if (!(cause instanceof CheckpointCandidateTooLargeError)) throw cause;
-    overflow = cause;
+    if ('settled' in hmidAttempt) return hmidAttempt.settled;
+    overflow = hmidAttempt.overflow;
+    lastOverflowed = hmidAttempt.overflowedMessages;
+  } else if (session.fitsRecoveryTarget && !overflow) {
+    const fallback = await tryRecoveryTargetFallback({
+      input,
+      session,
+      hvideoMessages: hvideo.messages,
+      fallbackCandidates,
+      instructions,
+      counter,
+    });
+    if ('settled' in fallback) return fallback.settled;
+    overflow = fallback.overflow;
+    lastOverflowed = fallback.overflowedMessages;
   }
 
+  if (overflow !== undefined && session.fitsRecoveryTarget && lastOverflowed) {
+    const stepped = await stepDownOverflowedSuffix({
+      input,
+      session,
+      overflowedMessages: lastOverflowed,
+      instructions,
+      counter,
+    });
+    if ('settled' in stepped) return stepped.settled;
+    overflow = stepped.overflow ?? overflow;
+  }
+
+  // No middle-deletion or suffix step-down succeeded cleanly; keep Hmin as
+  // the last resort instead of failing closed here.
   return generateHminCheckpoint({
     input,
     session,
@@ -695,6 +722,162 @@ async function recoverAfterHall({
     counter,
     overflow,
   });
+}
+
+type CandidateAttemptResult =
+  | {
+      readonly settled: {
+        readonly generation: CheckpointGeneration;
+        readonly attempts: number;
+        readonly maxOutputTokens: number;
+        readonly hmidOverflowRecovered?: true;
+        readonly tokenUsage?: CompactionTokenUsage;
+      };
+    }
+  | {
+      readonly overflow: CheckpointCandidateTooLargeError | undefined;
+      readonly overflowedMessages?: readonly AgentMessage[];
+    };
+
+async function tryCandidateGeneration({
+  input,
+  session,
+  candidate,
+  counter,
+  messages,
+  instructions,
+}: {
+  readonly input: CompactContextInput;
+  readonly session: CheckpointSession;
+  readonly candidate: CheckpointCandidate;
+  readonly counter: { value: number };
+  readonly messages: readonly AgentMessage[];
+  readonly instructions: string | undefined;
+}): Promise<CandidateAttemptResult> {
+  input.signal?.throwIfAborted();
+  try {
+    const settled = await generateCandidateWithProviderRetry({
+      input,
+      session,
+      candidate,
+      counter,
+      messages,
+      instructions,
+    });
+    return {
+      settled: {
+        generation: settled.generation,
+        attempts: settled.attemptNumber,
+        maxOutputTokens: session.maxOutputTokens,
+        ...tokenUsageMetadata(input.checkpoint.getTokenUsage?.()),
+      },
+    };
+  } catch (cause) {
+    if (!(cause instanceof CheckpointCandidateTooLargeError)) throw cause;
+    return { overflow: cause, overflowedMessages: messages };
+  }
+}
+
+async function tryRecoveryTargetFallback({
+  input,
+  session,
+  hvideoMessages,
+  fallbackCandidates,
+  instructions,
+  counter,
+}: {
+  readonly input: CompactContextInput;
+  readonly session: CheckpointSession;
+  readonly hvideoMessages: readonly AgentMessage[];
+  readonly fallbackCandidates: ReadonlyArray<{
+    readonly candidate: CheckpointCandidate;
+    readonly messages: readonly AgentMessage[];
+  }>;
+  readonly instructions: string | undefined;
+  readonly counter: { value: number };
+}): Promise<CandidateAttemptResult> {
+  const targetFits = session.fitsRecoveryTarget;
+  if (targetFits) {
+    const suffix = buildRecoverySuffixCandidate(hvideoMessages, (messages) =>
+      targetFits(checkpointRequest(input, messages, instructions)),
+    );
+    if (suffix) {
+      return tryCandidateGeneration({
+        input,
+        session,
+        candidate: 'hmid',
+        counter,
+        messages: suffix,
+        instructions,
+      });
+    }
+  }
+  const providerHmid = buildMiddleDeletionCandidate(hvideoMessages, (messages) =>
+    session.fits(checkpointRequest(input, messages, instructions)),
+  );
+  if (providerHmid) {
+    return tryCandidateGeneration({
+      input,
+      session,
+      candidate: 'hmid',
+      counter,
+      messages: providerHmid,
+      instructions,
+    });
+  }
+  if (counter.value > 0) {
+    return { overflow: undefined };
+  }
+  const smallerFit = [...fallbackCandidates]
+    .reverse()
+    .find((entry) => session.fits(checkpointRequest(input, entry.messages, instructions)));
+  if (!smallerFit) {
+    return { overflow: undefined };
+  }
+  return tryCandidateGeneration({
+    input,
+    session,
+    candidate: smallerFit.candidate,
+    counter,
+    messages: smallerFit.messages,
+    instructions,
+  });
+}
+
+async function stepDownOverflowedSuffix({
+  input,
+  session,
+  overflowedMessages,
+  instructions,
+  counter,
+}: {
+  readonly input: CompactContextInput;
+  readonly session: CheckpointSession;
+  readonly overflowedMessages: readonly AgentMessage[];
+  readonly instructions: string | undefined;
+  readonly counter: { value: number };
+}): Promise<CandidateAttemptResult> {
+  let base = overflowedMessages;
+  let lastOverflow: CheckpointCandidateTooLargeError | undefined;
+  while (true) {
+    const halved = buildHalvedSuffixCandidate(base, (messages) =>
+      session.fits(checkpointRequest(input, messages, instructions)),
+    );
+    if (!halved) {
+      return { overflow: lastOverflow, overflowedMessages: base };
+    }
+    const attempt = await tryCandidateGeneration({
+      input,
+      session,
+      candidate: 'hmid',
+      counter,
+      messages: halved,
+      instructions,
+    });
+    if ('settled' in attempt) return attempt;
+    lastOverflow = attempt.overflow;
+    base = halved;
+  }
 }
 
 async function generateHminCheckpoint({
@@ -795,7 +978,11 @@ async function generateCheckpointAttempt({
 }): Promise<CheckpointGeneration> {
   const startedAt = performance.now();
   try {
-    const generation = await session.generate(checkpointRequest(input, messages, instructions));
+    const request = checkpointRequest(input, messages, instructions);
+    if (candidate !== 'h0') {
+      markPrunedCheckpointHistory(request.messages);
+    }
+    const generation = await session.generate(request);
     reportCheckpointAttempt(input, {
       candidate,
       attemptNumber,

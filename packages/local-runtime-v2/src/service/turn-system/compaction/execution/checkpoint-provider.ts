@@ -3,6 +3,12 @@ import { Buffer } from 'node:buffer';
 import type { AgentMessage, StreamFn, ThinkingLevel } from '@earendil-works/pi-agent-core';
 import { isContextOverflow, type AssistantMessage, type UserMessage } from '@earendil-works/pi-ai';
 import {
+  isLLMRequestOversized,
+  normalizeLLMError,
+  toLLMMetricErrorKind,
+  type LLMMetricErrorKind,
+} from '@mavis/shared/llm-error-classifier';
+import {
   isLLMImageLimitMessage,
   isLLMRequestTooLargeMessage,
   keepsRequestImages,
@@ -14,6 +20,10 @@ import {
 } from '@mavis/agent-core/pi-turn-runner';
 import { createDefaultTokenEstimator, withoutThinking } from '@mavis/context-manager';
 
+import {
+  isPrunedCheckpointHistory,
+  markPrunedContextMessages,
+} from '../../../model-system/resolution/dynamic-max-tokens.js';
 import type { CheckpointSession } from '../algorithm/compact-context.js';
 import type { ContextCompactionHooks, PromptSnapshotSource } from '../../agent-host/contracts.js';
 import type { CheckpointGeneration } from '../algorithm/checkpoint-format.js';
@@ -264,6 +274,9 @@ async function requestCheckpoint(
       onRequestSettled,
       sessionId,
     );
+    if (isPrunedCheckpointHistory(input.messages)) {
+      markPrunedContextMessages(context.messages);
+    }
     const stream = await options.streamFn(options.model, context, streamOptions);
     // Pi providers drive the stream producer; result() does not require draining the iterator.
     const final = await stream.result();
@@ -281,10 +294,11 @@ async function requestCheckpoint(
       outcome: input.signal?.aborted ? 'abort' : 'error',
       usageComplete: false,
     });
-    if (isExplicitInputTooLargeError(error)) throw new CheckpointCandidateTooLargeError(error);
-    const message = error instanceof Error ? error.message : undefined;
+    const message = extractErrorMessage(error);
     if (isLLMImageLimitMessage(message)) throw new CheckpointCandidateMediaRejectedError(error);
-    if (isLLMRequestTooLargeMessage(message)) throw new CheckpointCandidateTooLargeError(error);
+    if (isThrownCandidateOverflow(error, message, options.model.contextWindow)) {
+      throw new CheckpointCandidateTooLargeError(error);
+    }
     throw error;
   }
 }
@@ -551,5 +565,64 @@ function isExplicitInputTooLargeError(error: unknown): boolean {
   }
   return [Reflect.get(error, 'status'), Reflect.get(error, 'statusCode')].some(
     (status) => status === 413 || (typeof status === 'string' && status.trim() === '413'),
+  );
+}
+
+function extractErrorMessage(error: unknown): string | undefined {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  if (!error || typeof error !== 'object') return undefined;
+  const direct = Reflect.get(error, 'message');
+  if (typeof direct === 'string') return direct;
+  const nested = Reflect.get(error, 'error');
+  if (!nested || typeof nested !== 'object') return undefined;
+  const nestedMessage = Reflect.get(nested, 'message');
+  return typeof nestedMessage === 'string' ? nestedMessage : undefined;
+}
+
+const NON_OVERFLOW_THROWN_KINDS: ReadonlySet<LLMMetricErrorKind> = new Set([
+  'abort',
+  'timeout',
+  'network',
+  'tpm_rate_limited',
+  'rate_limited',
+  'usage_limit',
+  'credits_exhausted',
+  'auth',
+  'overloaded',
+  'server_error',
+  'not_found',
+]);
+
+function isThrownCandidateOverflow(
+  error: unknown,
+  message: string | undefined,
+  contextWindow: number,
+): boolean {
+  if (isExplicitInputTooLargeError(error)) return true;
+  const normalized = normalizeLLMError({
+    raw: error,
+    ...(message !== undefined ? { errorMessage: message } : {}),
+  });
+  if (isLLMRequestOversized(normalized)) return true;
+  const { facts } = normalized;
+  if (NON_OVERFLOW_THROWN_KINDS.has(toLLMMetricErrorKind(facts))) {
+    return false;
+  }
+  const status = [facts.httpStatus, facts.upstreamStatusCode].find(
+    (code): code is number => typeof code === 'number' && code >= 100 && code <= 599,
+  );
+  if (status !== undefined && status !== 400 && status !== 413 && status !== 422) {
+    return false;
+  }
+  if (!message) return false;
+  return isContextOverflow(
+    {
+      role: 'assistant',
+      content: [],
+      stopReason: 'error',
+      errorMessage: message,
+    } as unknown as AssistantMessage,
+    contextWindow,
   );
 }

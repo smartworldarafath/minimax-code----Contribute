@@ -1988,6 +1988,52 @@ describe('compactContext final admission sizing and bypass', () => {
   });
 });
 
+describe('compactContext recovery target fit', () => {
+  it('skips unreduced H0 and shrinks to the first Hmid candidate accepted by fitsRecoveryTarget', async () => {
+    const h0 = [
+      checkpointRoot(0),
+      assistantText('a', 1),
+      assistantText('b', 2),
+      assistantText('c', 3),
+      user('trigger', 4),
+    ];
+    const generate = vi.fn<CheckpointSession['generate']>(async () => generation());
+    const decision = await compactContext(
+      policyInput(h0, {
+        open: async () => ({
+          maxOutputTokens: 100,
+          fits: () => true,
+          fitsRecoveryTarget: (request) => request.messages.length <= 3,
+          generate,
+        }),
+      }),
+    );
+
+    expect(decision).toMatchObject({ method: 'llm_checkpoint' });
+    expect(generate).toHaveBeenCalledOnce();
+    expect(generate.mock.calls[0]?.[0]?.messages).toHaveLength(3);
+  });
+
+  it('falls back to session.fits on irreducible H0 when no smaller candidate can be built', async () => {
+    const h0 = [user('first', 1), user('second', 2)];
+    const generate = vi.fn<CheckpointSession['generate']>(async () => generation());
+    const decision = await compactContext(
+      policyInput(h0, {
+        open: async () => ({
+          maxOutputTokens: 100,
+          fits: () => true,
+          fitsRecoveryTarget: () => false,
+          generate,
+        }),
+      }),
+    );
+
+    expect(decision).toMatchObject({ method: 'llm_checkpoint' });
+    expect(generate).toHaveBeenCalledOnce();
+    expect(generate.mock.calls[0]?.[0]?.messages).toBe(h0);
+  });
+});
+
 function policyInput(
   h0: readonly AgentMessage[],
   overrides: Partial<CompactContextInput> & {

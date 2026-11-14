@@ -53,6 +53,7 @@ export class ContextUsageAnchorState {
   private readonly anchorsByScope = new Map<string, StoredAnchor>();
   private readonly epochsByScope = new Map<string, number>();
   private readonly keysByScope = new Map<string, ContextUsageAnchorKey>();
+  private readonly invalidatedScopes = new Set<string>();
 
   bind(input: ContextUsageAnchorKeyInput): {
     readonly state: ContextUsageAnchorState;
@@ -86,6 +87,7 @@ export class ContextUsageAnchorState {
 
   invalidate(scope: string): void {
     this.anchorsByScope.delete(scope);
+    this.invalidatedScopes.add(scope);
   }
 
   record(input: {
@@ -106,6 +108,7 @@ export class ContextUsageAnchorState {
       return false;
     }
 
+    this.invalidatedScopes.delete(input.key.scope);
     this.anchorsByScope.set(input.key.scope, {
       key: { ...input.key },
       historyEpoch: input.historyEpoch,
@@ -121,7 +124,13 @@ export class ContextUsageAnchorState {
     readonly messages: readonly AgentMessage[];
   }): ContextUsageAnchorMatch | undefined {
     const anchor = this.anchorsByScope.get(input.key.scope);
-    if (!anchor || anchor.historyEpoch !== input.historyEpoch || !sameKey(anchor.key, input.key)) {
+    if (!anchor) {
+      if (input.historyEpoch === 0 && !this.invalidatedScopes.has(input.key.scope)) {
+        return resolvePersistedUsageAnchor(input.key, input.messages);
+      }
+      return undefined;
+    }
+    if (anchor.historyEpoch !== input.historyEpoch || !sameKey(anchor.key, input.key)) {
       return undefined;
     }
 
@@ -164,6 +173,26 @@ function sameKey(left: ContextUsageAnchorKey, right: ContextUsageAnchorKey): boo
     left.model === right.model &&
     left.contextFingerprint === right.contextFingerprint
   );
+}
+
+function resolvePersistedUsageAnchor(
+  key: ContextUsageAnchorKey,
+  messages: readonly AgentMessage[],
+): ContextUsageAnchorMatch | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message) continue;
+    // Never anchor to assistant usage that predates an already-applied compaction boundary.
+    if (message.role === 'compactionSummary') return undefined;
+    if (!assistantMatchesKey(message, key)) continue;
+    const absoluteTokens = readAbsoluteTokens(message);
+    if (absoluteTokens === undefined) continue;
+    return {
+      absoluteTokens,
+      trailingMessages: messages.slice(index + 1),
+    };
+  }
+  return undefined;
 }
 
 function assistantMatchesKey(message: AgentMessage, key: ContextUsageAnchorKey): boolean {

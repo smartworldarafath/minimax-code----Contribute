@@ -6,8 +6,16 @@ import {
 } from '@mavis/protocol';
 import { describe, expect, it, vi } from 'vitest';
 
-import { streamSimple } from '@earendil-works/pi-ai';
+import type { StreamFn } from '@earendil-works/pi-agent-core';
+import {
+  createAssistantMessageEventStream,
+  streamSimple,
+  type AssistantMessage,
+  type Context,
+  type Model,
+} from '@earendil-works/pi-ai';
 
+import { withLocalDynamicMaxTokens } from './dynamic-max-tokens.js';
 import { LocalModelResolver, lookupLocalModelLimits } from './local-model-resolver.js';
 import { OPENPLATFORM_THINKING_VARIANTS_CAPABILITY } from './openplatform-thinking.js';
 import { capabilitiesFromModelConfig, modelRefForModel } from './model-ref.js';
@@ -1773,5 +1781,103 @@ describe('Google custom providers', () => {
       config: { thinkingConfig: { thinkingLevel: 'HIGH' } },
     });
     expect(payload).not.toHaveProperty('reasoning');
+  });
+});
+
+describe('withLocalDynamicMaxTokens', () => {
+  const m3Flash: Model<'anthropic-messages'> = {
+    id: 'MiniMax-M3.1-Flash',
+    name: 'MiniMax-M3.1-Flash',
+    api: 'anthropic-messages',
+    provider: 'minimax',
+    baseUrl: 'https://example.invalid',
+    reasoning: true,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+  };
+
+  function emptyStream() {
+    const stream = createAssistantMessageEventStream();
+    stream.push({ type: 'error', reason: 'aborted', error: {} as AssistantMessage });
+    return stream;
+  }
+
+  it('uses settled persisted assistant usage so a 92%-full M3.1-Flash session does not overflow 1M with 128k maxTokens', async () => {
+    const capturedMaxTokens: Array<number | undefined> = [];
+    const inner = vi.fn<StreamFn>(async (_model, _context, options) => {
+      capturedMaxTokens.push(options?.maxTokens);
+      return emptyStream();
+    });
+    const stream = withLocalDynamicMaxTokens(inner);
+    const context: Context = {
+      systemPrompt: 'system',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'initial request' }], timestamp: 1 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'prior settled reply' }],
+          api: 'anthropic-messages',
+          provider: 'minimax',
+          model: 'MiniMax-M3.1-Flash',
+          usage: {
+            input: 20_573,
+            output: 1_000,
+            cacheRead: 899_000,
+            cacheWrite: 0,
+            totalTokens: 920_573,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'stop',
+          timestamp: 2,
+        },
+        { role: 'user', content: [{ type: 'text', text: 'follow up' }], timestamp: 3 },
+      ],
+    };
+
+    await stream(m3Flash, context, { maxTokens: 128_000 });
+
+    expect(capturedMaxTokens).toHaveLength(1);
+    expect(capturedMaxTokens[0]).toBeLessThanOrEqual(1_000_000 - 2_048 - 920_573);
+    expect(capturedMaxTokens[0]).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('clamps maxTokens below the 16k outputFloor when less than 16k headroom remains', async () => {
+    const capturedMaxTokens: Array<number | undefined> = [];
+    const inner = vi.fn<StreamFn>(async (_model, _context, options) => {
+      capturedMaxTokens.push(options?.maxTokens);
+      return emptyStream();
+    });
+    const stream = withLocalDynamicMaxTokens(inner);
+    const context: Context = {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'start' }], timestamp: 1 },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'almost full' }],
+          api: 'anthropic-messages',
+          provider: 'minimax',
+          model: 'MiniMax-M3.1-Flash',
+          usage: {
+            input: 993_000,
+            output: 500,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 993_500,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'stop',
+          timestamp: 2,
+        },
+        { role: 'user', content: [{ type: 'text', text: 'next' }], timestamp: 3 },
+      ],
+    };
+
+    await stream(m3Flash, context, { maxTokens: 128_000 });
+
+    expect(capturedMaxTokens).toHaveLength(1);
+    expect(capturedMaxTokens[0]).toBeLessThanOrEqual(1_000_000 - 2_048 - 993_500);
+    expect(capturedMaxTokens[0]).toBeGreaterThanOrEqual(1_024);
   });
 });

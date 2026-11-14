@@ -8,7 +8,14 @@ import {
   type PiBeforeLlmCallHook,
   type PiTurnRunnerLogger,
 } from '@mavis/agent-core/pi-turn-runner';
+import { REQUEST_MEDIA_DEFAULTS } from '@mavis/config';
 import { resolveCompactionTokenBudget, withoutThinking } from '@mavis/context-manager';
+
+import {
+  isPrunedCheckpointHistory,
+  markPrunedCheckpointHistory,
+  markStaleAssistantUsage,
+} from '../../model-system/resolution/dynamic-max-tokens.js';
 
 import type {
   AutomaticContextCompactionInput,
@@ -185,7 +192,14 @@ function prepareAutomaticCompaction(
     normalTriggerMatched,
     shouldStart: toolResultCompactionPlan !== undefined || normalTriggerMatched,
     providerInputLimit,
+    recoveryDivisor: resolveRecoveryDivisor(recoveryDivisor),
   };
+}
+
+function resolveRecoveryDivisor(divisor: number | undefined): number {
+  return typeof divisor === 'number' && Number.isFinite(divisor) && divisor > 1
+    ? divisor
+    : REQUEST_MEDIA_DEFAULTS.recoveryDivisor;
 }
 
 function serializedBytesExceed(
@@ -232,6 +246,7 @@ async function runAutomaticPolicy(options: {
       hooks,
       tokensBefore: preparation.footprint.inputTokens,
       providerInputLimit: preparation.providerInputLimit,
+      recoveryDivisor: preparation.recoveryDivisor,
       promptSnapshots: options.promptSnapshots,
     }),
     ...automaticSubagentCapture(input.sessionId, options.checkpointState, options.logger),
@@ -256,12 +271,14 @@ function automaticCheckpoint({
   hooks,
   tokensBefore,
   providerInputLimit,
+  recoveryDivisor,
   promptSnapshots,
 }: {
   readonly input: AutomaticContextCompactionInput;
   readonly hooks: ContextCompactionHooks | undefined;
   readonly tokensBefore: number;
   readonly providerInputLimit: number;
+  readonly recoveryDivisor: number;
   readonly promptSnapshots: PromptSnapshotSource | undefined;
 }): CompactContextInput['checkpoint'] {
   return {
@@ -271,7 +288,14 @@ function automaticCheckpoint({
       ? { onAttemptSettled: hooks.onCheckpointAttemptSettled }
       : {}),
     ...(hooks?.getProviderTokenUsage ? { getTokenUsage: hooks.getProviderTokenUsage } : {}),
-    open: () => openAutomaticCheckpoint(input, hooks, providerInputLimit, promptSnapshots),
+    open: () =>
+      openAutomaticCheckpoint(
+        input,
+        hooks,
+        providerInputLimit,
+        recoveryDivisor,
+        promptSnapshots,
+      ),
   };
 }
 
@@ -279,6 +303,7 @@ async function openAutomaticCheckpoint(
   input: AutomaticContextCompactionInput,
   hooks: ContextCompactionHooks | undefined,
   providerInputLimit: number,
+  recoveryDivisor: number,
   promptSnapshots: PromptSnapshotSource | undefined,
 ): Promise<CheckpointSession> {
   if (!input.streamFn) {
@@ -308,27 +333,96 @@ async function openAutomaticCheckpoint(
     ...sharedPrefixOption(input),
   });
   const measure = session.measure;
+  const wrappedFits: CheckpointSession['fits'] = (request) =>
+    session.fits({
+      ...request,
+      messages: projectAutomaticContextRequestMessages(request.messages),
+    });
+  const wrappedMeasure: CheckpointSession['measure'] =
+    measure === undefined
+      ? undefined
+      : (request) =>
+          measure({
+            ...request,
+            messages: projectAutomaticContextRequestMessages(request.messages),
+          });
+  const fitsRecoveryTarget = buildRecoveryTargetPredicate({
+    input,
+    recoveryDivisor,
+    providerInputLimit,
+    fits: wrappedFits,
+    measure: wrappedMeasure,
+  });
   return {
     ...session,
-    fits: (request) =>
-      session.fits({
+    fits: wrappedFits,
+    ...(fitsRecoveryTarget === undefined ? {} : { fitsRecoveryTarget }),
+    ...(wrappedMeasure === undefined ? {} : { measure: wrappedMeasure }),
+    generate: async (request) => {
+      const projectedMessages = projectAutomaticContextRequestMessages(request.messages);
+      if (isPrunedCheckpointHistory(request.messages)) {
+        markPrunedCheckpointHistory(projectedMessages);
+      }
+      return await session.generate({
         ...request,
-        messages: projectAutomaticContextRequestMessages(request.messages),
-      }),
-    ...(measure === undefined
-      ? {}
-      : {
-          measure: (request: Parameters<NonNullable<CheckpointSession['measure']>>[0]) =>
-            measure({
-              ...request,
-              messages: projectAutomaticContextRequestMessages(request.messages),
-            }),
-        }),
-    generate: async (request) =>
-      await session.generate({
-        ...request,
-        messages: projectAutomaticContextRequestMessages(request.messages),
-      }),
+        messages: projectedMessages,
+      });
+    },
+  };
+}
+
+function buildRecoveryTargetPredicate({
+  input,
+  recoveryDivisor,
+  providerInputLimit,
+  fits,
+  measure,
+}: {
+  readonly input: AutomaticContextCompactionInput;
+  readonly recoveryDivisor: number;
+  readonly providerInputLimit: number;
+  readonly fits: CheckpointSession['fits'];
+  readonly measure: CheckpointSession['measure'];
+}): CheckpointSession['fitsRecoveryTarget'] {
+  if (!input.recovery || !measure || recoveryDivisor <= 1 || input.messages.length <= 2) {
+    return undefined;
+  }
+  const base = measure({ messages: [] });
+  const current = measure({ messages: input.messages });
+  const requestMessages =
+    input.recovery.requestMessages && input.recovery.requestMessages.length > 0
+      ? measure({ messages: input.recovery.requestMessages })
+      : undefined;
+  const rejectedInputTokens = Math.max(
+    current.inputTokens,
+    requestMessages?.inputTokens ?? 0,
+  );
+  const targetInputLimit = Math.min(
+    providerInputLimit,
+    base.inputTokens +
+      Math.floor(Math.max(0, rejectedInputTokens - base.inputTokens) / recoveryDivisor),
+  );
+  const targetSerializedBytes =
+    input.maxSerializedInputBytes === undefined
+      ? undefined
+      : Math.min(
+          input.maxSerializedInputBytes,
+          base.serializedBytes +
+            Math.floor(
+              Math.max(
+                0,
+                Math.max(current.serializedBytes, requestMessages?.serializedBytes ?? 0) -
+                  base.serializedBytes,
+              ) / recoveryDivisor,
+            ),
+        );
+  return (request) => {
+    if (!fits(request)) return false;
+    const measured = measure(request);
+    if (measured.inputTokens > targetInputLimit) return false;
+    return (
+      targetSerializedBytes === undefined || measured.serializedBytes <= targetSerializedBytes
+    );
   };
 }
 
@@ -368,6 +462,7 @@ function completedAutomaticCompaction(
     decision.method !== 'llm_checkpoint' && keepsRequestImages(input.model)
       ? withoutThinking(decision.replacementMessages)
       : [...decision.replacementMessages];
+  markStaleAssistantUsage(replacementMessages);
   const completed = {
     status: 'completed' as const,
     compactionId: `ctx_${randomUUID()}`,
