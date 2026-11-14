@@ -71,13 +71,11 @@ export async function ensureCanonicalHistoryMaterialized(
   }
 
   const checkpoint = await options.legacyHistory.checkpoints.getCheckpoint(options.sessionId);
-  if (checkpoint) {
-    if (!(await targetExists(options))) {
-      throw new Error(`Canonical history target is missing after migration: ${options.sessionId}`);
-    }
+  if (checkpoint && (await targetExists(options))) {
     return;
   }
 
+  // Missing target with an existing checkpoint is treated as stale so resumed sessions self-heal.
   const target = await options.files.readTarget(options.paths.messages);
   const selected = await selectLegacySource(options);
   const normalized = normalizeSelectedHistory(options.sessionId, selected.records);
@@ -94,6 +92,7 @@ export async function ensureCanonicalHistoryMaterialized(
     targetRevision: revision,
     materialization: materialized.materialization,
     normalization: normalized,
+    ...(checkpoint ? { staleCheckpoint: checkpoint } : {}),
   });
   await options.legacyHistory.checkpoints.upsertCheckpoint({
     sessionId: options.sessionId,
@@ -193,12 +192,14 @@ async function writeMaterializationReport(
     readonly targetRevision: string;
     readonly materialization: MaterializationMode;
     readonly normalization: LegacyHistoryNormalizationResult<CanonicalHistoryEnvelope>;
+    readonly staleCheckpoint?: CanonicalHistoryMigrationCheckpoint;
   },
 ): Promise<void> {
   if (
     report.source === 'empty' &&
     report.materialization === 'published' &&
-    report.normalization.warnings.length === 0
+    report.normalization.warnings.length === 0 &&
+    !report.staleCheckpoint
   ) {
     return;
   }
@@ -219,6 +220,12 @@ async function writeMaterializationReport(
             targetMessageCount: report.targetMessageCount,
             targetRevision: report.targetRevision,
             materialization: report.materialization,
+            ...(report.staleCheckpoint
+              ? {
+                  recoveredFromMissingTarget: true,
+                  previousCheckpoint: report.staleCheckpoint,
+                }
+              : {}),
             normalization: {
               stats: report.normalization.stats,
               warnings: report.normalization.warnings,

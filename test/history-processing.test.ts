@@ -912,9 +912,24 @@ describe('committed history read reuse', () => {
       await ensureCanonicalHistoryMaterialized({ ...options, legacyHistory });
       expect(read).toHaveBeenCalledTimes(1);
       await rm(paths.messages);
-      await expect(
-        ensureCanonicalHistoryMaterialized({ ...options, legacyHistory }),
-      ).rejects.toThrow('missing after migration');
+      await ensureCanonicalHistoryMaterialized({ ...options, legacyHistory });
+      expect(legacyHistory.sources.readLedgerSnapshot).toHaveBeenCalledTimes(1);
+      expect(legacyHistory.checkpoints.upsertCheckpoint).toHaveBeenCalledTimes(1);
+      expect(await files.readStrict(paths.messages)).toEqual([]);
+      const report = JSON.parse(
+        await readFile(join(paths.reports, 'history-materialization.json'), 'utf8'),
+      );
+      expect(report).toMatchObject({
+        sessionId,
+        source: 'empty',
+        targetMessageCount: 0,
+        recoveredFromMissingTarget: true,
+        previousCheckpoint: {
+          sessionId,
+          source: 'empty',
+          targetRevision: 'recorded',
+        },
+      });
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }
@@ -1070,6 +1085,195 @@ describe('committed history read reuse', () => {
     append.mockRejectedValueOnce(new Error('write failed'));
     await expect(store.append(change)).rejects.toThrow('write failed');
     expect(readActive).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('stale migration checkpoint recovery', () => {
+  it('rematerializes missing messages from sqlite-rows when a stale checkpoint exists and resumes cleanly', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'mcode-stale-checkpoint-sqlite-'));
+    try {
+      const session: SessionRecord = {
+        sessionId: 'stale-sqlite-session',
+        agentName: 'test',
+        workspaceDir: dataDir,
+        runtime: 'pi-agent',
+        sessionType: 'root',
+        sessionKind: 'conversation',
+        archived: false,
+        status: 'idle',
+        createdAtMs: 1_700_000_000_000,
+        updatedAtMs: 1_700_000_000_000,
+      };
+      let checkpoint:
+        | {
+            sessionId: string;
+            migratedAtMs: number;
+            source: 'ledger-snapshot' | 'sqlite-rows' | 'sqlite-blob' | 'empty';
+            messageCount: number;
+            targetRevision: string;
+          }
+        | undefined = {
+        sessionId: session.sessionId,
+        migratedAtMs: 100,
+        source: 'sqlite-rows',
+        messageCount: 1,
+        targetRevision: 'stale-revision',
+      };
+      const files = createCanonicalHistoryFileAdapter();
+      const paths = resolveSessionHistoryPaths(dataDir, session);
+      await mkdir(paths.sessionDir, { recursive: true });
+      await writeFile(
+        paths.manifest,
+        JSON.stringify({
+          schemaVersion: 1,
+          sessionId: session.sessionId,
+          createdAtMs: session.createdAtMs,
+          updatedAtMs: session.updatedAtMs,
+          source: 'local-runtime',
+          layout: 'v2-final-dated-session',
+          paths: {
+            sessionDir: paths.sessionDir,
+            ledger: join(paths.sessionDir, 'ledger.jsonl'),
+            display: join(paths.sessionDir, 'display.jsonl'),
+            snapshot: join(paths.sessionDir, 'snapshot.json'),
+            reports: paths.reports,
+          },
+        }),
+      );
+
+      let targetPresentOnCheckpointUpsert = false;
+      const upsertCheckpoint = vi.fn(async (next: NonNullable<typeof checkpoint>) => {
+        targetPresentOnCheckpointUpsert = Boolean(await files.targetExists?.(paths.messages));
+        checkpoint = next;
+      });
+      const legacyHistory = {
+        sources: {
+          readLedgerSnapshot: vi.fn(async () => undefined),
+          readSqliteRows: vi.fn(async () => [
+            {
+              message_id: 'msg-1',
+              turn_id: 'turn-1',
+              message: { role: 'user', content: 'recovered prompt', timestamp: 1 },
+            },
+          ]),
+          readSqliteBlob: vi.fn(async () => []),
+        },
+        checkpoints: {
+          getCheckpoint: vi.fn(async () => checkpoint),
+          upsertCheckpoint,
+        },
+      };
+
+      const provider = createSessionSystemCanonicalHistoryProvider({
+        dataDir,
+        sessions: { get: async () => session },
+        files,
+        legacyHistory,
+      });
+
+      const active = await provider.readActive(session.sessionId);
+      expect(active.messages).toHaveLength(1);
+      expect(active.messages[0]).toMatchObject({ role: 'user', content: 'recovered prompt' });
+      expect(targetPresentOnCheckpointUpsert).toBe(true);
+      expect(upsertCheckpoint).toHaveBeenCalledTimes(1);
+      expect(checkpoint?.source).toBe('sqlite-rows');
+      expect(checkpoint?.messageCount).toBe(1);
+      expect(checkpoint?.targetRevision).not.toBe('stale-revision');
+
+      // Once repaired, subsequent resumes take the fast path without re-reading legacy sources.
+      await provider.readActive(session.sessionId);
+      expect(legacyHistory.sources.readLedgerSnapshot).toHaveBeenCalledTimes(1);
+      expect(legacyHistory.sources.readSqliteRows).toHaveBeenCalledTimes(1);
+      expect(upsertCheckpoint).toHaveBeenCalledTimes(1);
+
+      const appended = await provider.append({
+        sessionId: session.sessionId,
+        turnId: 'turn-2',
+        reason: 'messageDelta',
+        messages: [{ role: 'user', content: 'follow-up', timestamp: 2 }],
+        operation: { id: 'append-2', kind: 'append' },
+      });
+      expect(appended.messages).toHaveLength(2);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers ledger-snapshot during stale checkpoint recovery and never upserts before target exists', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'mcode-stale-checkpoint-ledger-'));
+    try {
+      const sessionId = 'stale-ledger-session';
+      const paths = resolveSessionHistoryPaths(dataDir, { sessionId, createdAtMs: 0 });
+      const files = createCanonicalHistoryFileAdapter();
+      const upsertCheckpoint = vi.fn(async () => {});
+      const legacyHistory = {
+        sources: {
+          readLedgerSnapshot: vi.fn(async () => [
+            {
+              message_id: 'msg-ledger-1',
+              turn_id: 'turn-1',
+              message: { role: 'user', content: 'from ledger', timestamp: 10 },
+            },
+          ]),
+          readSqliteRows: vi.fn(async () => [
+            {
+              message_id: 'msg-sqlite-1',
+              turn_id: 'turn-1',
+              message: { role: 'user', content: 'from sqlite', timestamp: 10 },
+            },
+          ]),
+          readSqliteBlob: vi.fn(async () => []),
+        },
+        checkpoints: {
+          getCheckpoint: vi.fn(async () => ({
+            sessionId,
+            migratedAtMs: 50,
+            source: 'ledger-snapshot' as const,
+            messageCount: 1,
+            targetRevision: 'old-rev',
+          })),
+          upsertCheckpoint,
+        },
+      };
+
+      const failingPublish = vi
+        .spyOn(files, 'publishInitial')
+        .mockRejectedValueOnce(new Error('disk full'));
+      await expect(
+        ensureCanonicalHistoryMaterialized({
+          sessionId,
+          paths,
+          files,
+          legacyHistory,
+          nowMs: () => 200,
+        }),
+      ).rejects.toThrow('disk full');
+      expect(upsertCheckpoint).not.toHaveBeenCalled();
+      expect(await files.targetExists?.(paths.messages)).toBe(false);
+
+      failingPublish.mockRestore();
+      await ensureCanonicalHistoryMaterialized({
+        sessionId,
+        paths,
+        files,
+        legacyHistory,
+        nowMs: () => 201,
+      });
+      expect(upsertCheckpoint).toHaveBeenCalledTimes(1);
+      expect(upsertCheckpoint).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId,
+          migratedAtMs: 201,
+          source: 'ledger-snapshot',
+          messageCount: 1,
+        }),
+      );
+      const materialized = await files.readStrict(paths.messages);
+      expect(materialized).toHaveLength(1);
+      expect(materialized[0]?.message).toMatchObject({ content: 'from ledger' });
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
